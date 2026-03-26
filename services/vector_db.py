@@ -70,6 +70,14 @@ def add_incident(
     return document_id
 
 
+def delete_incident(incident_id: str) -> None:
+    if not incident_id:
+        return
+
+    collection = get_collection()
+    collection.delete(ids=[incident_id])
+
+
 def search_similar(text: str, n_results: int = 3) -> list[dict[str, Any]]:
     if not text.strip():
         return []

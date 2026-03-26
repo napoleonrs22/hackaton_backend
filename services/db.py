@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import DateTime, Float, Integer, String, Text
+from sqlalchemy import DateTime, Float, Integer, String, Text, select
 from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -50,6 +50,7 @@ class IncidentRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
+        index=True,
         nullable=False,
     )
 
@@ -75,6 +76,59 @@ async def save_incident(
             analysis_json=json.dumps(analysis, ensure_ascii=False),
         )
         session.add(record)
+        await session.flush()
+        incident_id = record.id
         await session.commit()
-        await session.refresh(record)
-        return record.id
+        return incident_id
+
+
+async def list_incidents() -> list[dict[str, Any]]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(
+                IncidentRecord.id,
+                IncidentRecord.lat,
+                IncidentRecord.lng,
+                IncidentRecord.image_path,
+                IncidentRecord.analysis_json,
+                IncidentRecord.created_at,
+            ).order_by(IncidentRecord.created_at.desc())
+        )
+        rows = result.all()
+
+        incidents: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                analysis = json.loads(row.analysis_json)
+            except json.JSONDecodeError:
+                analysis = {"raw": row.analysis_json}
+
+            incidents.append(
+                {
+                    "id": row.id,
+                    "lat": row.lat,
+                    "lng": row.lng,
+                    "image_path": row.image_path,
+                    "analysis": analysis,
+                    "created_at": row.created_at.isoformat(),
+                }
+            )
+
+        return incidents
+
+
+async def delete_incident(incident_id: int) -> dict[str, Any] | None:
+    async with SessionLocal() as session:
+        record = await session.get(IncidentRecord, incident_id)
+        if record is None:
+            return None
+
+        deleted_record = {
+            "id": record.id,
+            "image_path": record.image_path,
+        }
+
+        await session.delete(record)
+        await session.commit()
+
+        return deleted_record
