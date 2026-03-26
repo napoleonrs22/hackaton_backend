@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine # Используем alpine-версию, она весит значительно меньше
+    container_name: hack_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: hackathon
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hackathon"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build: .
+    container_name: hack_backend
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # Позволяет контейнеру видеть Ollama на твоем ПК
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8010:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/hackathon
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_MODEL: qwen3-vl:4b
+      IMAGE_MAX_SIZE: 640
+      IMAGE_JPEG_QUALITY: 85
+      QWEN_TIMEOUT_SECONDS: 120
+      OLLAMA_KEEP_ALIVE: 15m
+      UPLOAD_DIR: /app/storage
+      CHROMA_PATH: /app/storage/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - incident_storage:/app/storage
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  pgdata:
+  incident_storage:
