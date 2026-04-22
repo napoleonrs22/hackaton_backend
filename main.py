@@ -34,7 +34,7 @@ from services.vector_db import (
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Smart City AI Backend")
+app = FastAPI(title="VisionCity: AI-Inspector 24/7 Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,14 +44,15 @@ app.add_middleware(
 )
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5vl:3b")
-IMAGE_MAX_SIZE = int(os.getenv("IMAGE_MAX_SIZE", "620"))
-IMAGE_JPEG_QUALITY = int(os.getenv("IMAGE_JPEG_QUALITY", "85"))
-QWEN_TIMEOUT_SECONDS = float(os.getenv("QWEN_TIMEOUT_SECONDS", "60"))
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-vl:4b")
+IMAGE_MAX_SIZE = int(os.getenv("IMAGE_MAX_SIZE", "256"))
+IMAGE_JPEG_QUALITY = int(os.getenv("IMAGE_JPEG_QUALITY", "60"))
+QWEN_TIMEOUT_SECONDS = float(os.getenv("QWEN_TIMEOUT_SECONDS", "15"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "15m")
-FAST_MODE_IMAGE_BYTES = int(os.getenv("FAST_MODE_IMAGE_BYTES", "800000"))
-OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "1024"))
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "120"))
+FAST_MODE_IMAGE_BYTES = int(os.getenv("FAST_MODE_IMAGE_BYTES", "200000"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1000"))
+OLLAMA_RETRY_NUM_PREDICT = int(os.getenv("OLLAMA_RETRY_NUM_PREDICT", "3000"))
 LLM_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "1")))
 VECTOR_REUSE_SCORE = float(os.getenv("VECTOR_REUSE_SCORE", "0.9"))
 IMAGE_ANALYSIS_CACHE_SIZE = max(1, int(os.getenv("IMAGE_ANALYSIS_CACHE_SIZE", "256")))
@@ -62,10 +63,37 @@ UPLOAD_ROOT = Path(os.getenv("UPLOAD_DIR", "storage"))
 UPLOADS_DIR = UPLOAD_ROOT / "uploads"
 LLM_SEMAPHORE = Semaphore(LLM_MAX_CONCURRENCY)
 IMAGE_ANALYSIS_CACHE: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
-REAL_INCIDENT_CATEGORIES = {"мусор", "дороги", "свет"}
+REAL_INCIDENT_CATEGORIES = {"мусор", "дороги", "свет", "люки", "инфраструктура"}
+CATEGORY_ALIASES = {
+    "мусор": "мусор",
+    "trash": "мусор",
+    "garbage": "мусор",
+    "отходы": "мусор",
+    "дорога": "дороги",
+    "дороги": "дороги",
+    "яма": "дороги",
+    "ямы": "дороги",
+    "pothole": "дороги",
+    "road": "дороги",
+    "свет": "свет",
+    "фонарь": "свет",
+    "фонари": "свет",
+    "lighting": "свет",
+    "люк": "люки",
+    "люки": "люки",
+    "manhole": "люки",
+    "инфраструктура": "инфраструктура",
+    "infrastructure": "инфраструктура",
+}
+SERVICE_BY_CATEGORY = {
+    "мусор": "клининг",
+    "дороги": "дорожная служба",
+    "свет": "электрики",
+    "люки": "аварийная служба",
+    "инфраструктура": "служба эксплуатации инфраструктуры",
+}
 
 
-# ==================== SCHEMA ====================
 class IncidentAnalysis(BaseModel):
     is_fake: bool
     confidence: float
@@ -76,35 +104,91 @@ class IncidentAnalysis(BaseModel):
     urgency: str
     recommendation: str
 
-# ==================== PROMPT ====================
 IMAGE_ANALYSIS_PROMPT = """
-Ты — узкоспециализированный AI-инспектор Smart City по контролю чистоты.
-Твоя единственная цель: выявлять незаконные свалки, переполненные контейнеры и разбросанный мусор.
+Ты — VisionCity: AI-Инспектор 24/7 для городских коммунальных служб.
+Твоя задача — по фотографии определить, есть ли реальная городская проблема, классифицировать ее, оценить срочность и дать рекомендацию ответственной службе.
 
-ПРАВИЛА КЛАССИФИКАЦИИ:
-1. is_fake = true, если:
-   - Это НЕ фото (мем, скриншот, нейросеть, постер).
-   - На фото НЕТ мусора (просто чистая улица, парк, люди, машины, ямы на дорогах или сломанные фонари). Для этой системы отсутствие мусора = нецелевая заявка (фейк).
-2. is_fake = false, если:
-   - На фото четко виден мусор (любого типа).
-   - Фото реальное, но плохого качества (размыто, темно) — в этом случае ставь низкий confidence и recommendation: "требуется уточнение".
+ГОРОДСКИЕ ПРОБЛЕМЫ, КОТОРЫЕ НУЖНО ПРИНИМАТЬ:
+- мусор: свалка, переполненная урна или контейнер, разбросанные отходы, строительный мусор, покрышки.
+- дороги: яма, разрушенный асфальт, провал, опасная трещина, повреждение проезжей части или тротуара.
+- свет: неработающий, поврежденный или упавший фонарь, проблема с уличным освещением.
+- люки: открытый, отсутствующий, поврежденный или просевший люк, опасная крышка колодца.
+- инфраструктура: сломанная остановка, знак, ограждение, скамейка, бордюр, плитка, оголенный провод или другое повреждение городской инфраструктуры.
 
-ДЕТАЛИЗАЦИЯ (только если is_fake = false):
-- category: всегда "мусор" (если это не мусор, ставь is_fake=true).
-- trash_type: бытовой | строительный | покрышки | крупногабаритный | пластик | смешанный.
-- volume: очень маленький (окурок/бутылка) | средний (пакет/бачок) | большой (свалка/гора).
-- urgency: low (единичный мусор) | medium (заполненный бак) | high (стихийная свалка, токсичные отходы).
+ПРАВИЛА is_fake:
+1. is_fake = true, если изображение не является фото городской проблемы:
+   - мем, скриншот, постер, рисунок, сгенерированная картинка;
+   - селфи, еда, животные, интерьер, реклама, документ или другой нерелевантный контент;
+   - обычная чистая улица без видимой проблемы.
+2. is_fake = false, если на фото есть хотя бы одна городская проблема из списка выше.
+3. Если фото реальное, но плохого качества, ставь is_fake = false только если проблему можно распознать. Если проблема неразличима, ставь низкий confidence и recommendation: "требуется ручная проверка".
+
+CATEGORY:
+- Верни ровно одну категорию: "мусор", "дороги", "свет", "люки", "инфраструктура".
+- Если проблем несколько, выбери самую опасную.
+- Не ставь категорию "мусор" автоматически: классифицируй динамически по содержанию фото.
+
+URGENCY:
+- high: опасно для жизни/транспорта/пешеходов. Примеры: открытый люк, большая яма на дороге, оголенный провод, упавший столб, опасный провал.
+- medium: мешает городу, но не выглядит немедленно опасным. Примеры: мусорная куча, переполненный контейнер, сломанный фонарь, поврежденная остановка.
+- low: небольшая или некритичная проблема. Примеры: мелкий мусор, небольшая трещина, легкое повреждение элемента инфраструктуры.
+
+RECOMMENDATION:
+- Всегда укажи ответственную службу и конкретное действие:
+  - мусор → клининг;
+  - дороги → дорожная служба;
+  - свет → электрики;
+  - люки → аварийная служба;
+  - инфраструктура → служба эксплуатации инфраструктуры.
+
+ПОЛЯ ОТВЕТА:
+- problem: кратко опиши, что сломано/загрязнено и где это видно на фото.
+- category: одна из категорий выше.
+- trash_type: поле оставлено для совместимости; заполни типом проблемы, например "бытовой мусор", "яма", "открытый люк", "неработающий фонарь", "сломанное ограждение".
+- volume: масштаб проблемы: "малый", "средний" или "большой".
+- urgency: "low", "medium" или "high".
+- recommendation: ответственная служба + действие.
 
 ОТВЕТ СТРОГО JSON:
 {
   "is_fake": boolean,
   "confidence": float,
-  "problem": "краткое описание что именно и где лежит",
-  "category": "мусор",
-  "trash_type": "тип",
-  "volume": "объем",
+  "problem": "краткое описание городской проблемы",
+  "category": "мусор|дороги|свет|люки|инфраструктура",
+  "trash_type": "тип проблемы",
+  "volume": "малый|средний|большой",
   "urgency": "low|medium|high",
-  "recommendation": "что сделать службе клининга"
+  "recommendation": "ответственная служба и конкретное действие"
+}
+""".strip()
+
+IMAGE_ANALYSIS_RETRY_PROMPT = """
+/no_think
+Ты — AI-инспектор городских проблем. Проанализируй фото и верни только JSON без рассуждений, markdown и пояснений.
+
+Прими только реальные городские проблемы: мусор, дороги, свет, люки, инфраструктура.
+Если на фото нет такой проблемы, поставь is_fake=true.
+Если проблема есть, поставь is_fake=false и выбери одну категорию:
+"мусор", "дороги", "свет", "люки", "инфраструктура".
+
+urgency:
+- high: опасно для людей/транспорта.
+- medium: заметная городская проблема без немедленной опасности.
+- low: небольшая некритичная проблема.
+
+recommendation должна назвать ответственную службу:
+мусор → клининг; дороги → дорожная служба; свет → электрики; люки → аварийная служба; инфраструктура → служба эксплуатации инфраструктуры.
+
+JSON schema:
+{
+  "is_fake": boolean,
+  "confidence": float,
+  "problem": "краткое описание",
+  "category": "мусор|дороги|свет|люки|инфраструктура",
+  "trash_type": "тип проблемы",
+  "volume": "малый|средний|большой",
+  "urgency": "low|medium|high",
+  "recommendation": "служба и действие"
 }
 """.strip()
 
@@ -139,12 +223,12 @@ def _fast_mode_analysis() -> dict[str, Any]:
     return {
         "is_fake": False,
         "confidence": 0.6,
-        "problem": "Обнаружен возможный мусор (fast mode)",
-        "category": "мусор",
-        "trash_type": "смешанный",
+        "problem": "Обнаружена возможная городская проблема (fast mode)",
+        "category": "инфраструктура",
+        "trash_type": "требуется уточнение",
         "volume": "средний",
         "urgency": "medium",
-        "recommendation": "Требуется проверка",
+        "recommendation": "Службе эксплуатации инфраструктуры требуется проверить заявку.",
     }
 
 
@@ -252,29 +336,50 @@ def _normalized_text(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _normalize_category(value: Any) -> str:
+    normalized = _normalized_text(value)
+    return CATEGORY_ALIASES.get(normalized, normalized)
+
+
 def _has_real_incident_category(analysis: dict[str, Any]) -> bool:
-    return _normalized_text(analysis.get("category")) in REAL_INCIDENT_CATEGORIES
+    return _normalize_category(analysis.get("category")) in REAL_INCIDENT_CATEGORIES
+
+
+def _ensure_service_recommendation(category: str, recommendation: Any) -> str:
+    service = SERVICE_BY_CATEGORY.get(category)
+    current = str(recommendation or "").strip()
+
+    if not service:
+        return current or "Требуется ручная проверка и назначение ответственной службы."
+
+    if service.lower() in current.lower():
+        return current
+
+    action = current or "требуется проверить заявку и устранить проблему."
+    return f"{service}: {action}"
 
 
 def _fix_llm_output(analysis: dict[str, Any]) -> dict[str, Any]:
     """
-    Если модель нашла мусор, но ошибочно считает это фейком — 
-    исправляем на 'не фейк' и повышаем уверенность.
+    Если модель нашла валидную городскую категорию, принимаем заявку как реальную
+    и дополняем рекомендацию ответственной службой.
     """
     normalized = dict(analysis)
+    category = _normalize_category(normalized.get("category"))
     
-    # Проверяем, относится ли категория к реальным (мусор, дороги, свет)
-    if _has_real_incident_category(normalized):
-        # Принудительно ставим, что это НЕ фейк
+    if category in REAL_INCIDENT_CATEGORIES:
+        normalized["category"] = category
         normalized["is_fake"] = False
-        
 
         current_conf = float(normalized.get("confidence") or 0.0)
         if current_conf < 0.7:
             normalized["confidence"] = 0.7
-            
-        normalized["recommendation"] = "Обнаружена реальная проблема. Заявка принята автоматически."
-        logger.info("analysis_auto_accepted_as_real_trash")
+
+        normalized["recommendation"] = _ensure_service_recommendation(
+            category,
+            normalized.get("recommendation"),
+        )
+        logger.info("analysis_auto_accepted category=%s", category)
         
     return normalized
 
@@ -304,37 +409,85 @@ def _needs_manual_review(analysis: dict[str, Any]) -> bool:
         return True
 
     return False
-async def analyze_with_llm(image_base64: str) -> dict[str, Any]:
-    body = {
+def _build_ollama_chat_body(
+    *,
+    image_base64: str,
+    prompt: str,
+    num_predict: int,
+) -> dict[str, Any]:
+    return {
         "model": OLLAMA_MODEL,
         "stream": False,
         "format": "json",
+        "think": False,
         "options": {
             "temperature": 0.0,
             "num_ctx": OLLAMA_NUM_CTX,
-            "num_predict": OLLAMA_NUM_PREDICT,
+            "num_predict": num_predict,
         },
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "messages": [
             {
                 "role": "user",
-                "content": IMAGE_ANALYSIS_PROMPT,
+                "content": prompt,
                 "images": [image_base64],
             }
         ],
     }
+
+
+async def analyze_with_llm(image_base64: str) -> dict[str, Any]:
+    attempts = [
+        ("primary", IMAGE_ANALYSIS_PROMPT, OLLAMA_NUM_PREDICT),
+        (
+            "json_retry",
+            IMAGE_ANALYSIS_RETRY_PROMPT,
+            max(OLLAMA_NUM_PREDICT, OLLAMA_RETRY_NUM_PREDICT),
+        ),
+    ]
     
     start = time.perf_counter()
 
-    response = await app.state.ollama_client.post("/chat", json=body)
-    response.raise_for_status()
+    last_error: Exception | None = None
+    for attempt_name, prompt, num_predict in attempts:
+        body = _build_ollama_chat_body(
+            image_base64=image_base64,
+            prompt=prompt,
+            num_predict=num_predict,
+        )
 
-    content = response.json().get("message", {}).get("content", "")
-    result = _extract_json(content)
+        response = await app.state.ollama_client.post("/chat", json=body)
+        response.raise_for_status()
 
-    logger.info("LLM took %sms", int((time.perf_counter() - start) * 1000))
+        response_payload = response.json()
+        message = response_payload.get("message", {})
+        content = message.get("content", "")
+        if not content.strip():
+            last_error = ValueError("Empty LLM response")
+            logger.warning(
+                "LLM returned empty content attempt=%s done_reason=%s thinking_chars=%s message_keys=%s",
+                attempt_name,
+                response_payload.get("done_reason"),
+                len(str(message.get("thinking", ""))),
+                sorted(message.keys()),
+            )
+            continue
 
-    return result
+        try:
+            result = _extract_json(content)
+        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            last_error = exc
+            logger.warning("LLM returned invalid JSON attempt=%s error=%s", attempt_name, exc)
+            continue
+
+        logger.info(
+            "LLM took %sms attempt=%s",
+            int((time.perf_counter() - start) * 1000),
+            attempt_name,
+        )
+        return result
+
+    raise last_error or ValueError("LLM analysis failed")
 
 @app.on_event("startup")
 async def startup():

@@ -32,15 +32,16 @@ services:
       - "8010:8000"
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/hackathon
-      OLLAMA_BASE_URL: http://10.206.2.194:11434
-      OLLAMA_MODEL: qwen2.5vl:3b
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_MODEL: qwen3-vl:4b
       IMAGE_MAX_SIZE: 620
       IMAGE_JPEG_QUALITY: 85
       QWEN_TIMEOUT_SECONDS: 120
       OLLAMA_KEEP_ALIVE: 15m
       FAST_MODE_IMAGE_BYTES: 800000
-      OLLAMA_NUM_CTX: 1024
-      OLLAMA_NUM_PREDICT: 120
+      OLLAMA_NUM_CTX: 2048
+      OLLAMA_NUM_PREDICT: 1000
+      OLLAMA_RETRY_NUM_PREDICT: 3000
       LLM_MAX_CONCURRENCY: 1
       IMAGE_ANALYSIS_CACHE_SIZE: 256
       IMAGE_ANALYSIS_CACHE_TTL_SECONDS: 900
